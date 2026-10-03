@@ -342,7 +342,23 @@ local function snapshot(value, depth, seen)
     end
   end
   seen[value] = nil
-  return out
+  -- Lovely's JSON encoder only accepts dense numeric arrays or string-keyed maps.
+  -- Runtime game tables can contain both kinds of keys, or sparse numeric keys.
+  local count, highest, dense_array = 0, 0, true
+  for k in pairs(out) do
+    count = count + 1
+    if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then
+      dense_array = false
+    elseif k > highest then
+      highest = k
+    end
+  end
+  if dense_array and count == highest then return out end
+  local object = {}
+  for k, v in pairs(out) do
+    object[tostring(k)] = v
+  end
+  return object
 end
 
 local function extract_card(card)

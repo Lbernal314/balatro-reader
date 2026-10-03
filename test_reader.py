@@ -44,6 +44,24 @@ class ManualSimulationTests(unittest.TestCase):
         self.data['registro']={'cambios':23}
         self.assertEqual(before,fingerprint(self.data))
 
+    def test_animated_ui_fields_do_not_interrupt_simulation(self):
+        self.data['joker_context']={'round_resets':{'blind_tag':{'tag_sprite':
+            {'container':{'collide_check_timer':12}}}},'unused_discards':3}
+        self.controller.submit(self.data)
+        self.data['joker_context']['round_resets']['blind_tag']['tag_sprite']['container']['collide_check_timer']=13
+        self.data['joker_context']['unused_discards']=4
+        self.data['hand']['cards'][0]['value']['effect']='Texto actualizado'
+        self.assertEqual(self.controller.view()['status'],'running')
+
+    def test_joker_value_and_blind_change_invalidate(self):
+        self.data['jokers']['cards']=[{'key':'j_popcorn','ability':{'mult':20}}]
+        self.controller.submit(self.data)
+        self.data['jokers']['cards'][0]['ability']['mult']=16
+        self.assertEqual(self.controller.view()['status'],'stale')
+        self.controller.submit(self.data)
+        self.data['blinds']['small']['score']=200
+        self.assertEqual(self.controller.view()['status'],'stale')
+
     def test_disconnect_hides_results(self):
         self.controller.submit(self.data)
         self.data=None

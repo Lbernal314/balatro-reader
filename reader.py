@@ -40,11 +40,33 @@ cache_lock = threading.Lock()
 cached = None
 problem = 'Esperando conexión con Balatro'
 def fingerprint(data):
-    value = copy.deepcopy({k:v for k,v in data.items() if k != 'registro'})
-    for key in ('hand','jokers','consumables','collection','draw_pool','shop','pack'):
-        for card in (value.get(key) or {}).get('cards',[]):
-            if isinstance(card.get('state'),dict):
-                card['state'].pop('highlight',None)
+    def area_cards(name):
+        cards = (data.get(name) or {}).get('cards', [])
+        return [{
+            'id': card.get('id'), 'key': card.get('key'),
+            'value': {key: (card.get('value') or {}).get(key) for key in ('rank','suit')},
+            'modifier': card.get('modifier'), 'ability': card.get('ability'),
+            'state': {key: (card.get('state') or {}).get(key) for key in ('hidden','debuff')},
+        } for card in cards]
+
+    round_info = data.get('round') or {}
+    context = data.get('joker_context') or {}
+    blind = next((b for b in (data.get('blinds') or {}).values()
+                  if isinstance(b,dict) and b.get('status') == 'CURRENT'), None)
+    value = {
+        'state': data.get('state'), 'deck': data.get('deck'),
+        'ante_num': data.get('ante_num'), 'round_num': data.get('round_num'),
+        'money': data.get('money'),
+        'round': {key: round_info.get(key) for key in ('chips','hands_left','discards_left','hands_played')},
+        'blind': blind, 'blind_disabled': (context.get('blind') or {}).get('disabled'),
+        'hand_limit': (data.get('hand') or {}).get('highlighted_limit'),
+        'hand': area_cards('hand'), 'draw_pool': area_cards('draw_pool'),
+        'jokers': area_cards('jokers'),
+        'hands': {name: {key: hand.get(key) for key in ('chips','mult')}
+                  for name, hand in (data.get('hands') or {}).items()},
+        'tarot_used': (context.get('consumeable_usage_total') or {}).get('tarot'),
+        'dollar_buffer': context.get('dollar_buffer'),
+    }
     return json.dumps(value,sort_keys=True)
 
 

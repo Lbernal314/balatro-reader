@@ -22,15 +22,46 @@ ENHANCEMENTS = {'': 0, 'BONUS': 1, 'MULT': 2, 'WILD': 3, 'GLASS': 4,
 EDITIONS = {'': 0, 'FOIL': 1, 'HOLO': 2, 'POLYCHROME': 3, 'NEGATIVE': 0}
 SUPPORTED = {'j_joker', 'j_half', 'j_banner', 'j_mystic_summit', 'j_blue_joker',
              'j_abstract', 'j_fortune_teller', 'j_bull', 'j_bootstraps',
-             'j_gros_michel', 'j_cavendish', 'j_jolly', 'j_zany', 'j_mad',
+             'j_gros_michel', 'j_cavendish', 'j_popcorn', 'j_ramen', 'j_hologram',
+             'j_greedy_joker', 'j_lusty_joker', 'j_wrathful_joker', 'j_gluttenous_joker',
+             'j_jolly', 'j_zany', 'j_mad',
              'j_crazy', 'j_droll', 'j_sly', 'j_wily', 'j_clever', 'j_devious',
              'j_crafty'}
+PASSIVE_BOSSES = {'The Wall', 'Violet Vessel', 'The Water', 'The Needle',
+                  'The Manacle'}
+SUIT_JOKERS = {'j_greedy_joker', 'j_lusty_joker', 'j_wrathful_joker',
+               'j_gluttenous_joker'}
 
 def mapping(value):
     return value if isinstance(value, dict) else {}
 
 def normalized(value):
     return str(value or '').upper().removeprefix('M_').removeprefix('E_').replace(' CARD', '')
+
+
+def boss_effect(state, blind, hand, pool):
+    if blind.get('type') != 'BOSS' or mapping(mapping(state.get('joker_context')).get('blind')).get('disabled'):
+        return None
+    name = blind.get('name', '')
+    if name == 'The Hook':
+        # The Hook removes two unplayed cards before scoring. For the supported
+        # effects, the random identity matters only if a held Steel card could
+        # be removed. Ramen's loss per discarded card is handled in scores().
+        # Future hands are outside the one-play lookahead.
+        if any(normalized(mapping(card.get('modifier')).get('enhancement')) == 'STEEL'
+               and not mapping(card.get('state')).get('debuff') for card in hand + pool):
+            raise ValueError('The Hook puede descartar una carta de acero retenida antes de puntuar; falta simular ese azar.')
+        return 'The Hook descarta 2 cartas aleatorias retenidas al jugar. El efecto sobre manos posteriores queda fuera de esta búsqueda de una jugada.'
+    if name == 'The Mouth':
+        if (state.get('round') or {}).get('hands_played',0) and not any(
+                (hand_info or {}).get('played_this_round',0) for hand_info in (state.get('hands') or {}).values()):
+            raise ValueError('The Mouth exige repetir el tipo de mano jugado, pero falta ese dato en el estado.')
+        return 'The Mouth anula la puntuación de los tipos de mano distintos del primero jugado en esta ronda.'
+    if name in PASSIVE_BOSSES:
+        # Their target, hand size, or available resources are already present
+        # in the live state used by the evaluator.
+        return f'{name}: se usan el objetivo y los recursos actuales de la partida.'
+    raise ValueError(f'Falta implementar el efecto de la ciega jefe {name or "desconocida"}.')
 
 def pack(card):
     v, a, mod, flags = [mapping(card.get(k)) for k in ('value', 'ability', 'modifier', 'state')]
@@ -65,7 +96,7 @@ def selections(size, limit):
     return groups, padded
 
 class Evaluator:
-    def __init__(self, state, all_cards):
+    def __init__(self, state, all_cards, hook=False):
         self.state = state
         self.cards = np.array([pack(c) for c in all_cards] + [[0]*9], dtype=float)
         self.base_chips = np.array([mapping(mapping(state.get('hands')).get(n)).get('chips', b[0])
@@ -74,7 +105,25 @@ class Evaluator:
                                    for n, b in zip(NAMES, BASE)])
         self.jokers = mapping(state.get('jokers')).get('cards', [])
         self.limit = min(5, mapping(state.get('hand')).get('highlighted_limit', 5))
+        self.hook = hook
+        current_blind = next((b for b in mapping(state.get('blinds')).values()
+                              if isinstance(b,dict) and b.get('status') == 'CURRENT'), {})
+        self.mouth_hand = None
+        if current_blind.get('name') == 'The Mouth' and current_blind.get('type') == 'BOSS' \
+                and not mapping(mapping(state.get('joker_context')).get('blind')).get('disabled') \
+                and mapping(state.get('round')).get('hands_played',0):
+            self.mouth_hand = next((i for i,name in enumerate(NAMES)
+                                    if mapping(mapping(state.get('hands')).get(name)).get('played_this_round',0)),None)
         self.simple = bool(np.all(np.isin(self.cards[:,2],[0,1,7])) and np.all(self.cards[:,3:5] == 0) and np.all(self.cards[:,7] == 0))
+
+    def suit_jokers(self):
+        for joker in self.jokers:
+            if joker.get('key') not in SUIT_JOKERS or mapping(joker.get('state')).get('debuff'):
+                continue
+            extra = mapping(mapping(joker.get('ability')).get('extra'))
+            suit = {'Hearts':'H','Diamonds':'D','Clubs':'C','Spades':'S'}.get(extra.get('suit'))
+            if suit:
+                yield SUITS[suit], extra.get('s_mult',3)
 
     def order(self, indices):
         def key(index):
@@ -86,7 +135,7 @@ class Evaluator:
             return addition / (factor - 1)
         return sorted(indices, key=key, reverse=True)
 
-    def scores(self, hands, discards_left, remaining):
+    def scores(self, hands, discards_left, remaining, discarded_cards=0):
         """Evaluate every subset for all supplied hands in one vectorized batch."""
         groups, padded = selections(hands.shape[1], self.limit)
         hands = np.concatenate((hands, np.full((len(hands), 1), len(self.cards)-1)), axis=1)
@@ -97,6 +146,7 @@ class Evaluator:
         valid = picked != len(self.cards)-1
         real = valid & (rank > 0)
         size = valid.sum(axis=-1)
+        hook_discards = np.minimum(2, hands.shape[1]-1-size) if self.hook else 0
         counts = np.zeros(rank.shape, dtype=np.int8)
         for i in range(5):
             counts += ((rank == rank[..., i, None]) & real & real[..., i, None])
@@ -135,6 +185,8 @@ class Evaluator:
         if self.simple:
             chips = self.base_chips[kind] + np.sum(np.where(scoring,self.cards[:,6][picked],0),axis=-1)
             mult = self.base_mult[kind].astype(float)
+            for target, bonus in self.suit_jokers():
+                mult += bonus * np.sum(scoring & ((suit == target) | (enh == 3)),axis=-1)
         else:
             values = self.cards[picked]
             edition = values[...,3]
@@ -161,6 +213,8 @@ class Evaluator:
                     chips += np.where(triggered & (edition[..., i] == 1), 50, 0)
                     mult += np.where(triggered & (edition[..., i] == 2), 10, 0)
                     mult *= np.where(triggered & (edition[..., i] == 3), 1.5, 1)
+                    for target, bonus in self.suit_jokers():
+                        mult += np.where(triggered & ((values[..., i, 1] == target) | (enh[..., i] == 3)), bonus, 0)
             # Held steel cards apply after scoring played cards.
             original = self.cards[hands[:, :-1]]
             for i in range(hands.shape[1]-1):
@@ -176,9 +230,14 @@ class Evaluator:
             extra = a.get('extra', 0)
             e = mapping(extra)
             scalar = extra if isinstance(extra, (int,float)) else 0
+            ramen_factor = None
+            ramen_active = True
+            if key == 'j_ramen':
+                ramen_factor = a.get('x_mult',a.get('Xmult',2)) - (discarded_cards + hook_discards) * scalar
+                ramen_active = ramen_factor > 1
             ed = normalized(mapping(joker.get('modifier')).get('edition'))
-            if ed == 'FOIL': chips += 50
-            elif ed == 'HOLO': mult += 10
+            if ed == 'FOIL': chips += np.where(ramen_active,50,0)
+            elif ed == 'HOLO': mult += np.where(ramen_active,10,0)
             if key == 'j_joker': mult += a.get('mult',4)
             elif key == 'j_half': mult += np.where(size <= e.get('size',3),e.get('mult',20),0)
             elif key == 'j_banner': chips += discards_left * scalar
@@ -190,6 +249,10 @@ class Evaluator:
             elif key == 'j_bootstraps': mult += e.get('mult',2) * max(0,math.floor((self.state.get('money',0)+mapping(self.state.get('joker_context')).get('dollar_buffer',0))/e.get('dollars',5)))
             elif key == 'j_gros_michel': mult += e.get('mult',15)
             elif key == 'j_cavendish': mult *= e.get('Xmult',3)
+            elif key == 'j_hologram': mult *= a.get('x_mult',1)
+            elif key == 'j_popcorn': mult += a.get('mult',20)
+            elif key == 'j_ramen': mult *= np.where(ramen_active,ramen_factor,1)
+            elif key in SUIT_JOKERS: pass
             else:
                 condition = {'j_jolly':pair,'j_zany':three,'j_mad':two_pair,
                              'j_crazy':straight,'j_droll':flush,'j_sly':pair,
@@ -198,11 +261,14 @@ class Evaluator:
                 if key in {'j_sly','j_wily','j_clever','j_devious','j_crafty'}:
                     chips += np.where(condition, a.get('t_chips',0),0)
                 else: mult += np.where(condition,a.get('t_mult',0),0)
-            if ed == 'POLYCHROME': mult *= 1.5
-        return np.floor(chips * mult), kind, groups
+            if ed == 'POLYCHROME': mult *= np.where(ramen_active,1.5,1)
+        score = np.floor(chips * mult)
+        if self.mouth_hand is not None:
+            score = np.where(kind == self.mouth_hand,score,0)
+        return score, kind, groups
 
-    def best(self, hands, discards_left, remaining):
-        score, kinds, groups = self.scores(hands, discards_left, remaining)
+    def best(self, hands, discards_left, remaining, discarded_cards=0):
+        score, kinds, groups = self.scores(hands, discards_left, remaining, discarded_cards)
         # Subsets are ordered by size: ties preserve cards.
         index = score.argmax(axis=1)
         rows = np.arange(len(hands))
@@ -228,15 +294,17 @@ def analyze(state, trials=1000, seed=20261002, progress=None, cancelled=None):
         return {'status':'blocked','reason':'Reiniciá Balatro para leer los valores internos de los comodines.'}
     current_blind = next((b for b in mapping(state.get('blinds')).values()
                           if isinstance(b,dict) and b.get('status')=='CURRENT'),{})
-    blind_ctx = mapping(mapping(state.get('joker_context')).get('blind'))
-    if current_blind.get('type') == 'BOSS' and not blind_ctx.get('disabled'):
-        return {'status':'blocked','reason':'Los efectos de la ciega jefe todavía requieren simulación específica.'}
     if str(state.get('deck','')).upper() in {'PLASMA','B_PLASMA'}:
         return {'status':'blocked','reason':'Falta implementar la puntuación de la baraja Plasma.'}
     target = max(0,current_blind.get('score',0)-round_info.get('chips',0))
     if not current_blind:
         return {'status':'blocked','reason':'No se pudo identificar la ciega actual.'}
-    evaluator = Evaluator(state, hand+pool)
+    try:
+        blind_note = boss_effect(state,current_blind,hand,pool)
+    except ValueError as exc:
+        return {'status':'blocked','reason':str(exc)}
+    hook = current_blind.get('type') == 'BOSS' and current_blind.get('name') == 'The Hook' and not mapping(mapping(state.get('joker_context')).get('blind')).get('disabled')
+    evaluator = Evaluator(state, hand+pool, hook=hook)
     original = np.arange(len(hand))[None,:]
     discards = round_info.get('discards_left',0)
     scores, kinds, groups = evaluator.scores(original,discards,len(pool))
@@ -269,7 +337,7 @@ def analyze(state, trials=1000, seed=20261002, progress=None, cancelled=None):
                 'discards_after_action':discards-int(best['action']=='discard'),
                 'hand_cards':hand,
                 'elapsed_seconds':round(time.perf_counter()-started,2),
-                'scope':'Compara jugar ahora contra un descarte y la mejor jugada posterior. La probabilidad corresponde a superar la ciega con esa próxima jugada; no a ganar toda la ronda o partida. No usa consumibles ni simula más descartes futuros.',
+                'scope':'Compara jugar ahora contra un descarte y la mejor jugada posterior. La probabilidad corresponde a superar la ciega con esa próxima jugada; no a ganar toda la ronda o partida. No usa consumibles ni simula más descartes futuros.' + (' ' + blind_note if blind_note else ''),
                 'score_mode':'Puntuación determinista con los efectos implementados; Monte Carlo para los robos sin reemplazo.'}
     total_options=sum(math.comb(len(hand),k) for k in range(1,max_discard+1)) if discards>0 else 0
     if not pool and len(hand)<=max_discard and total_options:
@@ -286,7 +354,7 @@ def analyze(state, trials=1000, seed=20261002, progress=None, cancelled=None):
                 if not retained and not draw_count:
                     continue
                 new_hands = np.concatenate((np.tile(retained,(trials,1)),draws[:,:draw_count]),axis=1).astype(int)
-                sample_scores, _, _, _ = evaluator.best(new_hands,discards-1,len(pool)-draw_count)
+                sample_scores, _, _, _ = evaluator.best(new_hands,discards-1,len(pool)-draw_count,count)
                 probability = float(np.mean(sample_scores>=target))
                 candidates.append({'action':'discard','indices':[i+1 for i in remove],
                     'score':float(np.mean(sample_scores)), 'win_probability':probability,

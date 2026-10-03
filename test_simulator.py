@@ -73,6 +73,62 @@ class ScoringTests(unittest.TestCase):
         banana={'key':'j_cavendish','ability':{'extra':{'Xmult':3}},'modifier':{'edition':'HOLO'}}
         self.assertEqual(score(cards,[banana])[0],528)
 
+    def test_hologram_uses_live_multiplier_and_joker_order(self):
+        cards=[card('A')]
+        hologram={'key':'j_hologram','ability':{'x_mult':1.25,'extra':0.25}}
+        joker={'key':'j_joker','ability':{'mult':4}}
+        self.assertEqual(score(cards,[joker,hologram])[0],100)
+        self.assertEqual(score(cards,[hologram,joker])[0],84)
+
+    def test_popcorn_and_ramen_use_current_values(self):
+        cards=[card('A')]
+        popcorn={'key':'j_popcorn','ability':{'mult':12}}
+        ramen={'key':'j_ramen','ability':{'x_mult':1.8,'extra':0.01}}
+        self.assertEqual(score(cards,[popcorn,ramen])[0],374)
+
+    def test_ramen_decays_per_discarded_card(self):
+        cards=[card('A'),card('2')]
+        ramen={'key':'j_ramen','ability':{'x_mult':2,'extra':0.01}}
+        ev=Evaluator(state(cards,jokers=[ramen]),cards)
+        hands=np.array([[0,1]])
+        scores,_,groups=ev.scores(hands,0,0,discarded_cards=5)
+        self.assertEqual(scores[0,groups.index((0,))],31)
+
+    def test_hook_discards_reduce_ramen_before_scoring(self):
+        cards=[card('A'),card('2'),card('3')]
+        ramen={'key':'j_ramen','ability':{'x_mult':2,'extra':0.01},
+               'modifier':{'edition':'POLYCHROME'}}
+        ev=Evaluator(state(cards,jokers=[ramen]),cards,hook=True)
+        scores,_,groups=ev.scores(np.array([[0,1,2]]),0,0)
+        self.assertEqual(scores[0,groups.index((0,))],47)
+        self.assertEqual(scores[0,groups.index((0,1,2))],48)
+
+    def test_ramen_eaten_after_discard_loses_edition(self):
+        cards=[card('A')]
+        ramen={'key':'j_ramen','ability':{'x_mult':1.02,'extra':0.01},
+               'modifier':{'edition':'POLYCHROME'}}
+        ev=Evaluator(state(cards,jokers=[ramen]),cards)
+        scores,_,groups=ev.scores(np.array([[0]]),0,0,discarded_cards=3)
+        self.assertEqual(scores[0,groups.index((0,))],16)
+
+    def test_greedy_joker_counts_only_scoring_diamonds(self):
+        greedy={'key':'j_greedy_joker','ability':{'extra':{'suit':'Diamonds','s_mult':3}}}
+        cards=[card('A','D'),card('A','C'),card('2','D')]
+        self.assertEqual(score(cards,[greedy])[0],160)
+        self.assertEqual(score([card('A','D',seal='RED')],[greedy])[0],189)
+
+    def test_mouth_restricts_hands_after_first_play(self):
+        cards=[card('A','D'),card('A','C'),card('2','D')]
+        s=state(cards)
+        s['blinds']['small'].update(type='BOSS',name='The Mouth')
+        self.assertEqual(analyze(s,trials=20)['status'],'ready')
+        s['round']['hands_played']=1
+        s['hands']={'Pair':{'played_this_round':1}}
+        ev=Evaluator(s,cards)
+        scores,_,groups=ev.scores(np.array([[0,1,2]]),0,0)
+        self.assertEqual(scores[0,groups.index((0,))],0)
+        self.assertGreater(scores[0,groups.index((0,1))],0)
+
     def test_fullhouse_contains_two_pair(self):
         cards=[card(r,s) for r,s in zip('AAA22','HDCHD')]
         self.assertEqual(score(cards,[{'key':'j_mad','ability':{'t_mult':10}}])[0],1078)
@@ -116,6 +172,33 @@ class MonteCarloTests(unittest.TestCase):
             analyze(s)
         s=state([card('A')]);s['blinds']['small']['type']='BOSS'
         self.assertEqual(analyze(s)['status'],'blocked')
+
+    def test_hook_uses_current_hand_and_target(self):
+        s=state([card('A'),card('2')],[card('3')])
+        s['blinds']['small'].update(type='BOSS',name='The Hook',score=60)
+        s['round']['chips']=20
+        result=analyze(s,trials=20)
+        self.assertEqual(result['status'],'ready')
+        self.assertEqual(result['target'],40)
+        self.assertIn('The Hook descarta 2 cartas',result['scope'])
+
+    def test_hook_blocks_held_steel_uncertainty(self):
+        s=state([card('A'),card('2',enhancement='STEEL')])
+        s['blinds']['small'].update(type='BOSS',name='The Hook')
+        result=analyze(s,trials=20)
+        self.assertEqual(result['status'],'blocked')
+        self.assertIn('acero',result['reason'])
+        s['joker_context']={'blind':{'disabled':True}}
+        self.assertEqual(analyze(s,trials=20)['status'],'ready')
+
+    def test_passive_boss_uses_live_resources(self):
+        s=state([card('A')])
+        s['blinds']['small'].update(type='BOSS',name='The Water',score=200)
+        s['round']['discards_left']=0
+        result=analyze(s,trials=20)
+        self.assertEqual(result['status'],'ready')
+        self.assertEqual(result['discard_options'],0)
+        self.assertEqual(result['target'],200)
 
     def test_no_state_mutation(self):
         s=state([card('A')],[card('2')]);original=copy.deepcopy(s)
